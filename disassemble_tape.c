@@ -86,6 +86,7 @@
  * 22/09/2025 wje - Initial version
  * 23/09/2025 wje - Convert to two pass
  * 24/09/2025 wje - Make macro-style formatting of labels nicer, fixes for 'instructions' that are actually data
+ * 24/09/2025 wje - Add raw mode for tapes that don't have a standard loader, just dump everything as instructions
  *
  */
 #include <stdlib.h>
@@ -112,7 +113,7 @@
 #define OPR_MASK_STF 00010
 
 // The processing loop is a simple state machine
-typedef enum {START, RESTART, LOOKING, RIM, BIN} State;
+typedef enum {START, RESTART, LOOKING, RIM, BIN, RAW} State;
 
 // Indicates instruction-specific additional processing needed
 typedef enum {NONE, CAN_INDIRECT, IS_SKIP, IS_SHIFT, IS_OPR, IS_IOT, IS_LAW, IS_CALJDA, IS_ILLEGAL} Modifiers;
@@ -152,6 +153,7 @@ Special *findSpecial(Special *, int);
 
 // Set from cmd line args
 bool as_macro = false;
+bool raw_mode = false;
 bool unknown_iots = false;
 bool diagnostics = false;
 bool keep_rim = false;
@@ -308,6 +310,10 @@ char tmpstr[16];
                 keep_rim = true;
                 break;
 
+            case 'r':
+                raw_mode = true;
+                break;
+
             default:
                 usage();
                 break;
@@ -328,10 +334,13 @@ char tmpstr[16];
         exit(1);
     }
 
-    passOne(fP);                // first pass finds all locations that need labels and validates the tape.
-    fclose(fP);
-    fP = fopen(filenameP, "r"); // reopen for second pass
-    tape_loc = 0;               // reset tape position
+    if( !raw_mode )
+    {
+        passOne(fP);                // first pass finds all locations that need labels and validates the tape.
+        fclose(fP);
+        fP = fopen(filenameP, "r"); // reopen for second pass
+        tape_loc = 0;               // reset tape position
+    }
 
     if( as_macro )
     {
@@ -344,7 +353,7 @@ char tmpstr[16];
     }
 
     // We don't check for errors because those were already detected by pass one
-    state = START;
+    state = (raw_mode)?RAW:START;
     DIAGNOSTIC("Pass two started");
 
     // The state machine loop
@@ -465,6 +474,10 @@ char tmpstr[16];
                     state = LOOKING;
                 }
             }
+            break;
+
+        case RAW:
+            formatInstr(0, word);                       // we don't know the address
             break;
 
         default:
@@ -1115,12 +1128,14 @@ getLabel(int address, char* labelP)
 
 void usage()
 {
-    fprintf(stderr,"Usage: disassemble_tape [-midk] filename\n");
+    fprintf(stderr,"Usage: disassemble_tape [-midkr] filename\n");
     fprintf(stderr,"where:\n");
     fprintf(stderr,"m - output in pure macro assember form\n");
     fprintf(stderr,"i - print any unknown IOTs on stderr\n");
     fprintf(stderr,"d - enable diagnostics for debugging this progam\n");
     fprintf(stderr,"k - keep RIM loader code if seen and in macro mode; normally no because MACRO usually adds it\n");
+    fprintf(stderr,"r - raw mode, just dump every binary word as an instruction, no RIM or BIN checking\n");
+    fprintf(stderr,"    raw verrides all other flags except d\n");
     fprintf(stderr,"Flags can be together, -mid, or separate, -m -i -d\n");
     exit(1);
 }
