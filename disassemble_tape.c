@@ -85,11 +85,13 @@
  *
  * 22/09/2025 wje - Initial version
  * 23/09/2025 wje - Convert to two pass
+ * 24/09/2025 wje - Make macro-style formatting of labels nicer, fixes for 'instructions' that are actually data
  *
  */
 #include <stdlib.h>
 #include <stdio.h>
 #include <stdbool.h>
+#include <string.h>
 
 #define DIAGNOSTIC(args...) if( diagnostics ) {printf(args); printf("\n");}
 
@@ -203,7 +205,7 @@ CodeDef opcodes[] =                 // we don't use the indirect bit, so we have
         { "skp", IS_SKIP},                             // OP 64
         { "sft", IS_SHIFT},                            // OP 66
         { "law", IS_LAW},                              // OP 70
-        { "iot", IS_IOT},                               // OP 72
+        { "iot", IS_IOT},                              // OP 72
         { 0, IS_ILLEGAL},
         { "opr", IS_OPR}                               // OP 76
     };
@@ -741,13 +743,14 @@ int i;
 
     for( ;; )
     {
+        if( specP->modifiers == UNKNOWN )
+        {
+            break;                          // should be end of list
+        }
+
         if( specP->value == (op & specP->mask) )   // found it
         {
             break;
-        }
-        else if( specP->modifiers == UNKNOWN )
-        {
-            break;                          // should be end of list
         }
 
         specP++;
@@ -781,6 +784,8 @@ int opcode;
 int indirect;
 int operand;
 int tmp, tmp2;
+char tmpstr[32];
+char tmpstr2[32];
 CodeDef *instructionP;
 Special *sP;
 
@@ -903,53 +908,87 @@ Special *sP;
 
     case IS_OPR:
         // This one is a pain because multiple operations can be combined.
+        // Detecting extra bits, same.
+        // If we see any extra bits, then just the octal data is output.
         tmp = 0;                // set to 1 if we have printed one already
+        tmpstr[0] = 0;          // be sure we start empty
 
         printf(" ");
 
-        if( (operand & OPR_MASK_CLA) && !(operand & OPR_MASK_LAT) )
-        {
-            printf("%scla", tmp?"!":"");
-            tmp = 1;
-        }
-        if( operand & OPR_MASK_CLI )
-        {
-            printf("%scli", tmp?"!":"");
-            tmp = 1;
-        }
-        if( operand & OPR_MASK_CMA )
-        {
-            printf("%scma", tmp?"!":"");
-            tmp = 1;
-        }
-        if( operand & OPR_MASK_HLT )
-        {
-            printf("%shlt", tmp?"!":"");
-            tmp = 1;
-        }
-        if( (operand & OPR_MASK_CLA) && (operand & OPR_MASK_LAT) )
-        {
-            printf("%slat", tmp?"!":"");
-            tmp = 1;
-        }
+        // A special case is nothing set, means nop
         if( (operand & OPR_MASK_NOP) == 0 )
         {
-            printf("%sopr", tmp?"!":"");        // maacro seems to use this for an operate that does nothing
+            operand = 0;            // nothing left
+            strcat(tmpstr, "nop");
             tmp = 1;
         }
-        if( operand & OPR_MASK_STF )
+        else
         {
-            printf("%sstf %o", tmp?"!":"", operand & 07);
-            tmp = 1;
+            if( (operand & OPR_MASK_CLA) && !(operand & OPR_MASK_LAT) )
+            {
+                operand &= ~OPR_MASK_CLA;
+                sprintf(tmpstr2,"%scla %o", tmp?"!":"", operand & 07);
+                strcat(tmpstr, tmpstr2);
+                tmp = 1;
+            }
+            if( operand & OPR_MASK_CLI )
+            {
+                operand &= ~OPR_MASK_CLA;
+                sprintf(tmpstr2,"%sclf %o", tmp?"!":"", operand & 07);
+                strcat(tmpstr, tmpstr2);
+                tmp = 1;
+            }
+            if( operand & OPR_MASK_CMA )
+            {
+                operand &= ~OPR_MASK_CMA;
+                sprintf(tmpstr2,"%scma", tmp?"!":"");
+                strcat(tmpstr, tmpstr2);
+                tmp = 1;
+            }
+            if( operand & OPR_MASK_HLT )
+            {
+                operand &= ~OPR_MASK_HLT;
+                sprintf(tmpstr2,"%shlt", tmp?"!":"");
+                strcat(tmpstr, tmpstr2);
+                tmp = 1;
+            }
+            if( (operand & OPR_MASK_CLA) && (operand & OPR_MASK_LAT) )
+            {
+                operand &= ~(OPR_MASK_CLA | OPR_MASK_LAT);
+                sprintf(tmpstr2,"%slat", tmp?"!":"");
+                strcat(tmpstr, tmpstr2);
+                tmp = 1;
+            }
+            if( operand & OPR_MASK_STF )
+            {
+                operand &= (~OPR_MASK_STF | 07);
+                sprintf(tmpstr2,"%sstf %o", tmp?"!":"", operand & 07);
+                strcat(tmpstr, tmpstr2);
+                tmp = 1;
+            }
+            if( (operand & OPR_MASK_CLF) && !(operand & OPR_MASK_STF) )
+            {
+                operand &= ~(OPR_MASK_CLF | 07);
+                sprintf(tmpstr2,"%sclf %o", tmp?"!":"", operand & 07);
+                strcat(tmpstr, tmpstr2);
+                tmp = 1;
+            }
         }
-        if( (operand & OPR_MASK_CLF) && !(operand & OPR_MASK_STF) )
+
+        if( operand != 0 )                      // extra bits were left over, must be data
         {
-            printf("%sclf %o", tmp?"!":"", operand & 07);
-            tmp = 1;
+            printf("%4o", operand);
+        }
+        else
+        {
+            printf("%s", tmpstr);
         }
         break;
 
     case IS_IOT:
+        // Sometimes there are extra bits in the operand above the usual 6 bits
+        tmp2 = operand & 037700;
+
         sP = findSpecial(iots, operand);
         printf(" %s", sP->name);
 
@@ -963,7 +1002,8 @@ Special *sP;
                     operand |= 010000;       // include the bit in the output
                 }
 
-                printf("%s%05o", (as_macro)?"!":" ", operand);
+                printf("%s%05o", (as_macro)?"!":" | ", operand);
+
                 if( unknown_iots )
                 {
                     fprintf(stderr, "iot %05o\n", operand);
@@ -996,11 +1036,19 @@ Special *sP;
             {
                 printf(" %3o", tmp);
             }
+
+            tmp2 = 0;              // dpy uses some of the special bits
             break;
 
         case HAS_ID:            // some encode a subdevice, eg tape drive number
             printf(" %02o", (operand >> 6) & 077);
+            tmp2 = 0;
             break;
+        }
+
+        if( (sP->modifiers != UNKNOWN) && (tmp2 != 0) )
+        {
+            printf("%s%04o", (as_macro)?"!":" | ", tmp2);   // add extra bits
         }
         break;
     }
