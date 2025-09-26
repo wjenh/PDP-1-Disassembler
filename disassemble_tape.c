@@ -87,7 +87,8 @@
  * 23/09/2025 wje - Convert to two pass
  * 24/09/2025 wje - Make macro-style formatting of labels nicer, fixes for 'instructions' that are actually data
  * 24/09/2025 wje - Add raw mode for tapes that don't have a standard loader, just dump everything as instructions
- * 25/09/2025 wje - Various fixes around OPR and such. IMPORTANT - the macro1 cross-assembler is broken for lat -n!
+ * 25/09/2025 wje - Various fixes around OPR and such. IMPORTANT - the macro1 cross-assembler is broken for law -n!
+ * 25/09/2025 wje - So generate 'safe' macro1 for law -n
  *
  */
 #include <stdlib.h>
@@ -894,7 +895,10 @@ Special *sP;
         break;
 
     case IS_LAW:
-        printf(" %s %s%04o", instructionP->name, (indirect)?"-":"", operand);
+        // The versions of macro1 floating arund are broken, they don't hande the 'law -n' syntax properly.
+        // So, use a safe varsion.
+        //printf(" %s %s%04o", instructionP->name, (indirect)?"-":"", operand);
+        printf(" %s %s%04o", instructionP->name, (indirect)?"i ":"", operand);
         if( !as_macro )
         {
             printf(" (%d dec)", (indirect)?-operand:operand);
