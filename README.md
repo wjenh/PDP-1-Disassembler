@@ -2,7 +2,7 @@
 
 ## SYNOPSIS
 ```
-disassemble_tape  [-m] [-i] [-k] [-d] [-r] tapeimagefile >resultfile
+disassemble_tape  [-m] [-i] [-k] [-d] [-r] [-s] tapeimagefile >resultfile
 ```
 ## DESCRIPTION
 This is a two-pass disassembler for PDP-1 tape image files that contain RIM and BIN format data.
@@ -16,8 +16,9 @@ In macro mode, the standard MACRO syntax is used.
 - '-m' - macro mode, output is compatible with the MACRO1 assembler
 - '-i' - list unknown IOTs encountered on stderr
 - '-k' - if in macro mode an initial RIM code block will not be output because MACRO usuaally does it; this keeps it
-- '-r' - raw mode, all binary data is dumped as instructions, no loader searching is done
 - '-d' - debug mode, not useful except for debugging disassemble_tape
+- '-r' - raw mode, all binary data is dumped as instructions, no loader searching is done
+- '-s' - short label mode, labels are generated as 1-3 alpha characters instead of Lnnn
 - Options can be combined, e.g. -mi.
 
 ## LIMITATIONS
@@ -45,12 +46,20 @@ part of a label for the tape and will be output in the form they would appear if
 
 If binary characters occur outside of a RIM or BIN block, they could be data that is read under program control.
 THey will be ignored.
+
+## A NOTE ABOUT MACRO1
+Macro1, of which there are a few versions, is a cross-assembler for PDP-1 macro source.
+While it generally follows the native macro functionality, it does very limited error checking.
+It's quite easy to generate binaries that won't work, and unfortunately it rarely warns you.
+In fact, some appear correct in the listing, but the binary code that's output isn't correct.
+So, if you are having issues with code not working, carefully check your source.
+
 ## ERRORS
-The following errors are possible and will be reported on stderr after which an exit(1) is done.
+The following errors are possible and will be reported on stderr after which an exit(1) is done, except see EOF.
 - Incorrect command line arguments
 - Unterminated RIM block
 - Malformed BIN block
-- Premature EOF
+- Premature EOF. This results in a warning, but the code up to the EOF is still disassembled.
 
 ## BUILDING
 Just do:

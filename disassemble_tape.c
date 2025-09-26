@@ -89,6 +89,7 @@
  * 24/09/2025 wje - Add raw mode for tapes that don't have a standard loader, just dump everything as instructions
  * 25/09/2025 wje - Various fixes around OPR and such. IMPORTANT - the macro1 cross-assembler is broken for law -n!
  * 25/09/2025 wje - So generate 'safe' macro1 for law -n
+ * 25/09/2025 wje - Add a -s switch to generate 3 char labels for backwards compatibility
  *
  */
 #include <stdlib.h>
@@ -139,6 +140,13 @@ typedef struct
     int mask;               // the bits in the operand to use for comparison to value, value == (oprerand & mask)
 } Special;
 
+// This is used to hold label information
+typedef struct
+{
+    short flags;
+    char label[6];
+} Label;
+
 int addOnesComplement(int, int);
 int getWord(FILE *, int, int);
 void formatInstr(int, int);
@@ -148,7 +156,7 @@ void passOne(FILE *);
 void markValid(int);
 void markValidByInstruction(int, int);
 void markTarget(int);
-int getLabel(int, char*);
+int getLabel(int, int,  char*);
 
 void usage(void);
 Special *findSpecial(Special *, int);
@@ -159,9 +167,10 @@ bool raw_mode = false;
 bool unknown_iots = false;
 bool diagnostics = false;
 bool keep_rim = false;
+bool long_labels = true;
 
 int pass = 1;               // first pass
-int label_number = 1;       // used with memlocs and labels
+int label_number = 0;       // used with memlocs and labels
 int tape_loc = 0;
 int checksum = 0;
 State state;
@@ -171,9 +180,10 @@ char labelStr[16];          // for formatting a label
 // This array is used for tracking labels.
 // The low 9 bits are the label number.
 // It is indexed by a memoery address.
-short memlocs[4096];        // enough for the entire address space
-#define MEM_VALID   010000  // this location was seen as a load address in RIM or BIN
-#define MEM_TARGET  020000  // this location was seen as the target of a memoery reference
+Label memlocs[4096];       // enough for the entire address space
+
+#define MEM_VALID  01       // this location was seen as a load address in RIM or BIN
+#define MEM_TARGET 02       // this location was seen as the target of a memoery reference
 
 // Opcodes using only the high 5 bits, not the indirect bit, which means we only need 32 opcode entries.
 // This generally works, except for the JDA instruction, 17, which is handled specially.
@@ -316,6 +326,10 @@ char tmpstr[16];
                 raw_mode = true;
                 break;
 
+            case 's':
+                long_labels = false;
+                break;
+
             default:
                 usage();
                 break;
@@ -346,7 +360,7 @@ char tmpstr[16];
 
     if( as_macro )
     {
-        printf("Created by disasemble_tape -m %s\n", cP);
+        printf("Disassembled from %s\n", cP);
     }
     else
     {
@@ -377,17 +391,7 @@ char tmpstr[16];
                 state = RIM;
                 cur_addr = OPERAND(word);
 
-                if( as_macro )
-                {
-                    // We always emit the loader start address in case someone jumps to it
-                    printf("%o/\n", cur_addr);
-
-                    if( getLabel(cur_addr, tmpstr) )
-                    {
-                        printf("%s,\n", tmpstr);    // and emit it
-                    }
-                }
-                else
+                if( !as_macro )
                 {
                     printf("Start of RIM block at tape position %d\n", tape_loc - 3);
                     printf("Tape  Addr  Raw    Lbl  Instruction\n");
@@ -451,9 +455,11 @@ char tmpstr[16];
             {
                 if( as_macro )
                 {
-                    getLabel(OPERAND(word), labelStr);
-                    printf("      start %s\n", labelStr); // macro directive to give start addr
-                    did_start = true;
+                    if( getLabel(OPERAND(word), OPERAND(word), labelStr) != -1 )
+                    {
+                        printf("     start %s\n", labelStr); // macro directive to give start addr
+                        did_start = true;
+                    }
                 }
 
                 DIAGNOSTIC("Saw jmp %04o at tape location %d, new state is DATA", OPERAND(word), tape_loc);
@@ -557,8 +563,6 @@ char tmpstr[16];
                 if( as_macro )
                 {
                     DIAGNOSTIC("RIM start");
-                    markValid(cur_addr);            // mark the addr anyway, someone might jump to it from code
-                    markTarget(cur_addr);
                 }
 
                 if( (word = getWord(fP, 1, state)) == -1 )
@@ -589,9 +593,15 @@ char tmpstr[16];
             if( OPERATION(word) == 060 )        // end of RIM code block
             {
                 state = LOOKING;                // look for a BIN block now
-                DIAGNOSTIC("New state is LOOKING");
                 start_addr = OPERAND(word);
-                markValid(start_addr);
+
+                if( keep_rim )
+                {
+                    markValid(start_addr);
+                }
+
+                DIAGNOSTIC("End of RIM, start address %04o\n", start_addr);
+                DIAGNOSTIC("New state is LOOKING");
 
                 if( as_macro )
                 {
@@ -604,7 +614,7 @@ char tmpstr[16];
             else if( OPERATION(word) == 032 )   // next data word to load
             {
                 cur_addr = OPERAND(word);
-                markValid(cur_addr);
+                markValid(start_addr);
                 word = getWord(fP, 1, state);
             }
             else
@@ -676,7 +686,7 @@ char tmpstr[16];
         }
     }
 
-    markValid(start_addr);
+    //markValid(start_addr);
 }
 
 // Perform 18-bit 1's complement additon, handling the carry-wraparound.
@@ -829,25 +839,32 @@ int indirect;
 int operand;
 int tmp, tmp2;
 int bits03;
+char *cP;
 char tmpstr[32];
 char tmpstr2[32];
 CodeDef *instructionP;
 Special *sP;
 
-    if( as_macro )
+    if( getLabel(pc, pc, labelStr) != -1 )
     {
-        if( getLabel(pc, labelStr) )
+        strcat(labelStr,",");
+        for( tmp = strlen(labelStr) + 1; tmp++ < 6; )
         {
-            printf("%s,", labelStr);
-        }
-        else
-        {
-            printf("     ");           // line indent for macro
+            strcat(labelStr, " ");
         }
     }
     else
     {
-        printf("%-5d %04o: %06o %4s", tape_loc, pc, word, (getLabel(pc, labelStr))?labelStr:"    ");
+        labelStr[0] = '\0';
+    }
+
+    if( as_macro )
+    {
+        printf("%s", (labelStr[0] != '\0')?labelStr:"     ");
+    }
+    else
+    {
+        printf("%-5d %04o: %06o %s", tape_loc, pc, word, (labelStr[0] != '\0')?labelStr:"");
     }
 
     opcode = OPERATION(word);
@@ -855,6 +872,7 @@ Special *sP;
     opcode >>= 1;                                           // convert to 32 possible instructions
 
     operand = OPERAND(word);
+    DIAGNOSTIC("Pass 2 got opcode %02o, indirect %s, operand %04o\n", opcode, indirect?"y":"n", operand);
     instructionP = &opcodes[opcode];
 
     if( instructionP->modifiers == IS_ILLEGAL )            // not an instruction, leave blank unless macro mode
@@ -878,15 +896,15 @@ Special *sP;
         break;
 
     case CAN_INDIRECT:
-        getLabel(operand, labelStr);
-        printf(" %s%s %4s", instructionP->name, (indirect)?" i":"", labelStr);
+        getLabel(operand, operand, labelStr);
+        printf(" %s%s %s", instructionP->name, (indirect)?" i":"", labelStr);
         break;
 
     case IS_CALJDA:
         if( indirect )
         {
-            getLabel(operand, labelStr);
-            printf(" jda %4s", labelStr);
+            getLabel(operand, operand, labelStr);
+            printf(" jda %s", labelStr);
         }
         else
         {
@@ -1119,8 +1137,8 @@ markValid(int address)
 {
     address = OPERAND(address);         // for safety, limits it to 12 bits
 
-    memlocs[address] |= MEM_VALID;
-    DIAGNOSTIC("%06o marked as used", address);
+    memlocs[address].flags |= MEM_VALID;
+    DIAGNOSTIC("%06o marked as valid", address);
 }
 
 // Mark the address as used, and if word is an instruction that references memory, mark the target also
@@ -1147,41 +1165,104 @@ CodeDef *instructionP;
 void
 markTarget(int address)
 {
-    if( !(memlocs[address] & MEM_TARGET) )
+int itmp, itmp2;
+char ch;
+char *cP;
+
+    if( !(memlocs[address].flags & MEM_TARGET) )
     {
-        DIAGNOSTIC("%06o marked as target L%d", address, label_number);
-        memlocs[address] |= (MEM_TARGET | label_number++);
+        DIAGNOSTIC("%06o marked as target number %d", address, label_number);
+        memlocs[address].flags |= MEM_TARGET;
+
+        // construct the label
+        cP = memlocs[address].label;
+
+        if( long_labels )
+        {
+            sprintf(cP, "L%d", label_number);
+        }
+        else
+        {
+            ch = (label_number % 26) + 'a';
+
+            if( ch == 'i' )        // don't use i
+            {
+                ++label_number;
+                ++ch;
+            }
+
+            *cP++ = ch;
+
+            if( (label_number > 25) ) // has a second or third char
+            {
+                itmp = (label_number / 26) % 26;            // 2nd char
+                itmp2 = (label_number / (26 * 26)) % 26;    // third char
+
+                if( itmp || itmp2 )
+                {
+                    ch = itmp + 'a';
+
+                    if( ch == 'i' )        // don't use i
+                    {
+                        label_number += 27;
+                        ++ch;
+                    }
+
+                    *cP++ = ch;
+                }
+
+                if( itmp2 )
+                {
+                    ch = itmp2 + 'a';
+
+                    if( ch == 'i' )        // don't use i
+                    {
+                        label_number += (26 * 26) + 1;
+                        ++ch;
+                    }
+
+                    *cP++ = ch;
+                }
+            }
+
+            *cP = '\0';
+        }
+
+        ++label_number;
+        DIAGNOSTIC("Constructed label is %s\n", memlocs[address].label);
     }
 }
 
-// Return the label number if the address has been loaded and is the target of a memory reference, else 0
+// Return the label number if the address has been loaded and is the target of a memory reference, else -1
 // Format the proper result, either a label or the address if no label defined.
 int
-getLabel(int address, char* labelP)
+getLabel(int address, int defaultval, char* labelP)
 {
+char *cP;
+
     address = OPERAND(address);                   // for safety
 
-    if( (memlocs[address] & (MEM_VALID | MEM_TARGET)) == (MEM_VALID | MEM_TARGET) )
+    if( (memlocs[address].flags & (MEM_VALID | MEM_TARGET)) == (MEM_VALID | MEM_TARGET) )
     {
-        address = memlocs[address] & 0777;       // is now the label numbe
-        sprintf(labelP,"L%03d", address);
+        sprintf(labelP,"%s", memlocs[address].label);
         return( address );
     }
     else
     {
-        sprintf(labelP,"%04o",address);          // no label assigned
-        return( 0 );
+        sprintf(labelP,"%04o", defaultval);      // no label assigned
+        return( -1 );
     }
 }
 
 void usage()
 {
-    fprintf(stderr,"Usage: disassemble_tape [-midkr] filename\n");
+    fprintf(stderr,"Usage: disassemble_tape [-midksr] filename\n");
     fprintf(stderr,"where:\n");
     fprintf(stderr,"m - output in pure macro assember form\n");
     fprintf(stderr,"i - print any unknown IOTs on stderr\n");
     fprintf(stderr,"d - enable diagnostics for debugging this progam\n");
     fprintf(stderr,"k - keep RIM loader code if seen and in macro mode; normally no because MACRO usually adds it\n");
+    fprintf(stderr,"s - create only up to 3 char labels for compatibility with the native PDP-1 assembler\n");
     fprintf(stderr,"r - raw mode, just dump every binary word as an instruction, no RIM or BIN checking\n");
     fprintf(stderr,"    raw verrides all other flags except d\n");
     fprintf(stderr,"Flags can be together, -mid, or separate, -m -i -d\n");
