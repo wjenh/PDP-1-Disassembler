@@ -87,6 +87,7 @@
  * 23/09/2025 wje - Convert to two pass
  * 24/09/2025 wje - Make macro-style formatting of labels nicer, fixes for 'instructions' that are actually data
  * 24/09/2025 wje - Add raw mode for tapes that don't have a standard loader, just dump everything as instructions
+ * 25/09/2025 wje - Various fixes around OPR and such. IMPORTANT - the macro1 cross-assembler is broken for lat -n!
  *
  */
 #include <stdlib.h>
@@ -108,12 +109,12 @@
 #define OPR_MASK_CLI 04000
 #define OPR_MASK_CMA 01000
 #define OPR_MASK_HLT 00400
-#define OPR_MASK_LAT 02000
+#define OPR_MASK_LAT 02200
 #define OPR_MASK_NOP 07777
 #define OPR_MASK_STF 00010
 
 // The processing loop is a simple state machine
-typedef enum {START, RESTART, LOOKING, RIM, BIN, RAW} State;
+typedef enum {START, RESTART, LOOKING, RIM, BIN, DATA, RAW} State;
 
 // Indicates instruction-specific additional processing needed
 typedef enum {NONE, CAN_INDIRECT, IS_SKIP, IS_SHIFT, IS_OPR, IS_IOT, IS_LAW, IS_CALJDA, IS_ILLEGAL} Modifiers;
@@ -137,14 +138,14 @@ typedef struct
     int mask;               // the bits in the operand to use for comparison to value, value == (oprerand & mask)
 } Special;
 
-int adjustOverflow(int);
+int addOnesComplement(int, int);
 int getWord(FILE *, int, int);
 void formatInstr(int, int);
 void printTapeLeader(int);
 void passOne(FILE *);
 
-void markUsed(int);
-void markUsedByInstruction(int, int);
+void markValid(int);
+void markValidByInstruction(int, int);
 void markTarget(int);
 int getLabel(int, char*);
 
@@ -170,21 +171,21 @@ char labelStr[16];          // for formatting a label
 // The low 9 bits are the label number.
 // It is indexed by a memoery address.
 short memlocs[4096];        // enough for the entire address space
-#define MEM_VALID   01000   // this location was seen as a load address in RIM or BIN
-#define MEM_TARGET  02000   // this location was seen as the target of a memoery reference
+#define MEM_VALID   010000  // this location was seen as a load address in RIM or BIN
+#define MEM_TARGET  020000  // this location was seen as the target of a memoery reference
 
 // Opcodes using only the high 5 bits, not the indirect bit, which means we only need 32 opcode entries.
 // This generally works, except for the JDA instruction, 17, which is handled specially.
 
 CodeDef opcodes[] =                 // we don't use the indirect bit, so we have only 32 possibilities
     {
-        { 0, IS_ILLEGAL },                             // OP 0
+        { "illegal", IS_ILLEGAL },                     // OP 0
         { "and", CAN_INDIRECT},                        // OP 2
         { "ior", CAN_INDIRECT},                        // OP 4
         { "xor", CAN_INDIRECT},                        // OP 6
         { "xct", CAN_INDIRECT},                        // OP 10
-        { 0, IS_ILLEGAL},
-        { 0, IS_ILLEGAL},
+        { "illegal", IS_ILLEGAL},
+        { "illegal", IS_ILLEGAL},
         { "cal", IS_CALJDA},                           // OP 16, special, could be JDA
         { "lac", CAN_INDIRECT},                        // OP 20
         { "lio", CAN_INDIRECT},                        // OP 22
@@ -193,7 +194,7 @@ CodeDef opcodes[] =                 // we don't use the indirect bit, so we have
         { "dip", CAN_INDIRECT},                        // OP 30
         { "dio", CAN_INDIRECT},                        // OP 32
         { "dzm", CAN_INDIRECT},                        // OP 34
-        { 0, IS_ILLEGAL},
+        { "illegal", IS_ILLEGAL},
         { "add", CAN_INDIRECT},                        // OP 40
         { "sub", CAN_INDIRECT},                        // OP 42
         { "idx", CAN_INDIRECT},                        // OP 44
@@ -208,7 +209,7 @@ CodeDef opcodes[] =                 // we don't use the indirect bit, so we have
         { "sft", IS_SHIFT},                            // OP 66
         { "law", IS_LAW},                              // OP 70
         { "iot", IS_IOT},                              // OP 72
-        { 0, IS_ILLEGAL},
+        { "illegal", IS_ILLEGAL},
         { "opr", IS_OPR}                               // OP 76
     };
 
@@ -227,8 +228,8 @@ Special iots[] =
         {00005, "ppa", INVERT_WAIT, 077},
         {00006, "ppb", INVERT_WAIT, 077},
         {00030, "rrb", NORMAL, 077},
-        {00004, "tyi", INVERT_WAIT, 077},
-        {00003, "tyo", INVERT_WAIT, 077},
+        {00004, "tyi", CAN_WAIT, 077},
+        {00003, "tyo", CAN_WAIT, 077},
         {00051, "asc", CAN_WAIT, 077},
         {00000, "iot", UNKNOWN, 0}       // special end marker if nothing mathces, must be last
     };
@@ -377,9 +378,12 @@ char tmpstr[16];
 
                 if( as_macro )
                 {
-                    if( keep_rim )
+                    // We always emit the loader start address in case someone jumps to it
+                    printf("%o/\n", cur_addr);
+
+                    if( getLabel(cur_addr, tmpstr) )
                     {
-                        printf("%o/\n", cur_addr);
+                        printf("%s,\n", tmpstr);    // and emit it
                     }
                 }
                 else
@@ -437,7 +441,8 @@ char tmpstr[16];
 
                 word = getWord(fP, 2, state);         // will be 'dio endaddr + 1'
                 end_addr = OPERAND(word);       // last location + 1, in checksum as the dio instruction
-                checksum += word;
+
+                checksum = addOnesComplement(checksum, word);
 
                 state = BIN;
             }
@@ -445,11 +450,13 @@ char tmpstr[16];
             {
                 if( as_macro )
                 {
-                    printf("      start %o\n", OPERAND(word)); // macro directive to give start addr
+                    getLabel(OPERAND(word), labelStr);
+                    printf("      start %s\n", labelStr); // macro directive to give start addr
                     did_start = true;
                 }
 
-                state = RESTART;                // could be more on the tape, back to searching for RIM
+                DIAGNOSTIC("Saw jmp %04o at tape location %d, new state is DATA", OPERAND(word), tape_loc);
+                state = DATA;                // could be more on the tape, back to searching for RIM
             }
             else
             {
@@ -460,7 +467,7 @@ char tmpstr[16];
 
         case BIN:
             {
-                // word will contail the 18 bit value for the current pc
+                // word will contain the 18 bit value for the current pc
                 formatInstr(cur_addr++, word);
 
                 if( cur_addr >= end_addr )      // done, get the checksum from the tape, compare
@@ -478,6 +485,9 @@ char tmpstr[16];
 
         case RAW:
             formatInstr(0, word);                       // we don't know the address
+            break;
+
+        case DATA:                                      // we got past the end of all BIN blocks, ignore the rest
             break;
 
         default:
@@ -509,6 +519,8 @@ int word;
 int cur_addr;
 int end_addr;               // for BIN loader
 int start_addr = 4;        // for macro start, can come from RIM if no BIN blocks, 4 is the default if none
+CodeDef *instructionP;
+char tmpstr[16];
 
     state = START;
     DIAGNOSTIC("Starting pass one");
@@ -528,7 +540,7 @@ int start_addr = 4;        // for macro start, can come from RIM if no BIN block
                 exit(1);
             }
 
-            break;          // all done
+            return;          // all done
         }
 
         switch( state )
@@ -544,16 +556,22 @@ int start_addr = 4;        // for macro start, can come from RIM if no BIN block
                 if( as_macro )
                 {
                     DIAGNOSTIC("RIM start");
-                    if( keep_rim )
-                    {
-                        printf("%o/\n", cur_addr);
-                    }
+                    markValid(cur_addr);            // mark the addr anyway, someone might jump to it from code
+                    markTarget(cur_addr);
                 }
 
-                word = getWord(fP, 1, state);
+                if( (word = getWord(fP, 1, state)) == -1 )
+                {
+                    return;                         // all done
+                }
+
                 if( keep_rim )
                 {
-                    markUsedByInstruction(cur_addr, word);
+                    instructionP = &opcodes[OPERATION(word)];
+                    if( instructionP->modifiers == CAN_INDIRECT )
+                    {
+                        markValidByInstruction(cur_addr, word);
+                    }
                 }
             }
             else
@@ -572,6 +590,7 @@ int start_addr = 4;        // for macro start, can come from RIM if no BIN block
                 state = LOOKING;                // look for a BIN block now
                 DIAGNOSTIC("New state is LOOKING");
                 start_addr = OPERAND(word);
+                markValid(start_addr);
 
                 if( as_macro )
                 {
@@ -584,8 +603,8 @@ int start_addr = 4;        // for macro start, can come from RIM if no BIN block
             else if( OPERATION(word) == 032 )   // next data word to load
             {
                 cur_addr = OPERAND(word);
+                markValid(cur_addr);
                 word = getWord(fP, 1, state);
-                markUsed(cur_addr);
             }
             else
             {
@@ -611,7 +630,7 @@ int start_addr = 4;        // for macro start, can come from RIM if no BIN block
                     exit(1);
                 }
 
-                checksum += word;
+                checksum = addOnesComplement(checksum, word);
                 end_addr = OPERAND(word);
                 state = BIN;
                 DIAGNOSTIC("New state is BIN");
@@ -627,14 +646,13 @@ int start_addr = 4;        // for macro start, can come from RIM if no BIN block
         case BIN:
             {
                 // word will contain the 18 bit value for the current pc, add to checksum
-                checksum += word;
-                markUsedByInstruction(cur_addr++, word);
+                checksum = addOnesComplement(checksum, word);
+                markValidByInstruction(cur_addr++, word);
 
                 if( cur_addr >= end_addr )      // done, get the checksum from the tape, compare
                 {
                     DIAGNOSTIC("End of BIN block");
 
-                    checksum = adjustOverflow(checksum);
                     word = getWord(fP, 1, state);
 
                     if( as_macro )
@@ -657,7 +675,20 @@ int start_addr = 4;        // for macro start, can come from RIM if no BIN block
         }
     }
 
-    markUsed(start_addr);
+    markValid(start_addr);
+}
+
+// Perform 18-bit 1's complement additon, handling the carry-wraparound.
+int
+addOnesComplement(int a, int b)
+{
+    a += b;
+    if( a & 01000000 )
+    {
+        a = (a & 0777777) + 1;                    // had a carry, add it back in 
+    }
+
+    return( a );
 }
 
 // Adjust a 32bit checksum to adjust for overflow, original was calculated using 1's complement 18 bit addition
@@ -701,16 +732,15 @@ int saw_space;
     {
         if( (ch = fgetc(fP)) == EOF )
         {
-            if( (count == 2) && (last_ch == 0377) )
+            if( (count < 3) && (last_ch == 0377) )
             {
+                DIAGNOSTIC("Saw 0377 then EOF, done");
                 return( -1 );                  // Stop marker? 
             }
 
-            if( count != 3 )
+            if( (state != DATA) && (state != RAW) && (count != 3) )
             {
                 fprintf(stderr,"Premature EOF at tape position %d\n", tape_loc);
-                fclose(fP);
-                exit(1);
             }
 
             return( -1 );           // sorry
@@ -797,6 +827,7 @@ int opcode;
 int indirect;
 int operand;
 int tmp, tmp2;
+int bits03;
 char tmpstr[32];
 char tmpstr2[32];
 CodeDef *instructionP;
@@ -820,7 +851,8 @@ Special *sP;
 
     opcode = OPERATION(word);
     indirect = opcode & 01;
-    opcode >>= 1;
+    opcode >>= 1;                                           // convert to 32 possible instructions
+
     operand = OPERAND(word);
     instructionP = &opcodes[opcode];
 
@@ -891,7 +923,11 @@ Special *sP;
                 tmp >>= 1;
             }
 
-            printf(" %s  %3ds", sP->name, tmp2);
+            printf(" %s",  sP->name);
+            if( tmp2 != 0 )
+            {
+                printf("   %3ds", tmp2);        // only if we'e actually shifting
+            }
         }
         break;
 
@@ -932,22 +968,31 @@ Special *sP;
         if( (operand & OPR_MASK_NOP) == 0 )
         {
             operand = 0;            // nothing left
-            strcat(tmpstr, "nop");
-            tmp = 1;
+            strcpy(tmpstr, "nop");
         }
         else
         {
-            if( (operand & OPR_MASK_CLA) && !(operand & OPR_MASK_LAT) )
+            bits03 = operand & 07;              // needed for a few ops
+            operand &= 07770;
+
+            if( (operand & OPR_MASK_LAT) == OPR_MASK_LAT )    // MUST come befoe CLA! Only 2 bit directive.
+            {
+                operand &= ~OPR_MASK_LAT;
+                sprintf(tmpstr2,"%slat", tmp?"!":"");
+                strcat(tmpstr, tmpstr2);
+                tmp = 1;
+            }
+            if( operand & OPR_MASK_CLA )        // MUST come after LAT!
             {
                 operand &= ~OPR_MASK_CLA;
-                sprintf(tmpstr2,"%scla %o", tmp?"!":"", operand & 07);
+                sprintf(tmpstr2,"%scla", tmp?"!":"");
                 strcat(tmpstr, tmpstr2);
                 tmp = 1;
             }
             if( operand & OPR_MASK_CLI )
             {
-                operand &= ~OPR_MASK_CLA;
-                sprintf(tmpstr2,"%sclf %o", tmp?"!":"", operand & 07);
+                operand &= ~OPR_MASK_CLI;
+                sprintf(tmpstr2,"%scli", tmp?"!":"");
                 strcat(tmpstr, tmpstr2);
                 tmp = 1;
             }
@@ -965,32 +1010,27 @@ Special *sP;
                 strcat(tmpstr, tmpstr2);
                 tmp = 1;
             }
-            if( (operand & OPR_MASK_CLA) && (operand & OPR_MASK_LAT) )
+            if( !(operand & OPR_MASK_STF) && bits03 )
             {
-                operand &= ~(OPR_MASK_CLA | OPR_MASK_LAT);
-                sprintf(tmpstr2,"%slat", tmp?"!":"");
+                // CLF is bits03, already cleared
+                sprintf(tmpstr2,"%sclf %o", tmp?"!":"", bits03);
                 strcat(tmpstr, tmpstr2);
+                bits03 = 0;                  // done with these
                 tmp = 1;
             }
-            if( operand & OPR_MASK_STF )
+            if( (operand & OPR_MASK_STF) && bits03 )
             {
-                operand &= (~OPR_MASK_STF | 07);
-                sprintf(tmpstr2,"%sstf %o", tmp?"!":"", operand & 07);
+                operand &= ~OPR_MASK_STF;
+                sprintf(tmpstr2,"%sstf %o", tmp?"!":"", bits03);
                 strcat(tmpstr, tmpstr2);
-                tmp = 1;
-            }
-            if( (operand & OPR_MASK_CLF) && !(operand & OPR_MASK_STF) )
-            {
-                operand &= ~(OPR_MASK_CLF | 07);
-                sprintf(tmpstr2,"%sclf %o", tmp?"!":"", operand & 07);
-                strcat(tmpstr, tmpstr2);
+                bits03 = 0;                  // done with these
                 tmp = 1;
             }
         }
 
-        if( operand != 0 )                      // extra bits were left over, must be data
+        if( (operand | bits03) != 0 )                      // extra bits were left over, must be data
         {
-            printf("%4o", operand);
+            printf("%06o", word);
         }
         else
         {
@@ -1071,21 +1111,23 @@ Special *sP;
 
 // Set memory location as used, i.e. was loaded by loader
 void
-markUsed(int address)
+markValid(int address)
 {
+    address = OPERAND(address);         // for safety, limits it to 12 bits
+
     memlocs[address] |= MEM_VALID;
     DIAGNOSTIC("%06o marked as used", address);
 }
 
 // Mark the address as used, and if word is an instruction that references memory, mark the target also
 void
-markUsedByInstruction(int addr, int word)
+markValidByInstruction(int addr, int word)
 {
 int opcode;
 int operand;
 CodeDef *instructionP;
 
-    markUsed(addr);
+    markValid(addr);            //this address is used
 
     opcode = OPERATION(word);
     opcode >>= 1;               // ignore indirect bit
@@ -1113,6 +1155,8 @@ markTarget(int address)
 int
 getLabel(int address, char* labelP)
 {
+    address = OPERAND(address);                   // for safety
+
     if( (memlocs[address] & (MEM_VALID | MEM_TARGET)) == (MEM_VALID | MEM_TARGET) )
     {
         address = memlocs[address] & 0777;       // is now the label numbe
