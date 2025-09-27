@@ -44,8 +44,11 @@ Any non-binary character is ignored, even if in a word sequence.
 However, any non-binary characters that are seen up to the first binary character on a tape are considered to be
 part of a label for the tape and will be output in the form they would appear if you were looking at a physical tape.
 
-If binary characters occur outside of a RIM or BIN block, they could be data that is read under program control.
-THey will be ignored.
+If the next binary data after the end of a RIM block is not the start of a BIN block, or data after the end of
+a BIN block is not another BIN block, then that data is just dumped as octal values if in macro mode,
+disassembled if not.
+If the next binary data appears to be a BIN block but the next word is not a valid BIN block start, then that data
+and all following is also dumped and no further attempt is made to find a BIN block.
 
 ## A NOTE ABOUT MACRO1
 Macro1, of which there are a few versions, is a cross-assembler for PDP-1 macro source.
@@ -55,11 +58,16 @@ In fact, some appear correct in the listing, but the binary code that's output i
 So, if you are having issues with code not working, carefully check your source.
 
 ## ERRORS
-The following errors are possible and will be reported on stderr after which an exit(1) is done, except see EOF.
+The following errors are possible and will be reported on stderr after which an exit(1) is done:
 - Incorrect command line arguments
 - Unterminated RIM block
+
+## WARNINGS
 - Malformed BIN block
-- Premature EOF. This results in a warning, but the code up to the EOF is still disassembled.
+- Premature EOF
+For a malformed BIN block, processing continues as described above.
+For a premature EOF, a binary word of 3 characters was being assembled but EOF was seen before all 3 were read.
+In this case, pass 2 is still run ignoring the characters found.
 
 ## BUILDING
 Just do:

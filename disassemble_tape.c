@@ -17,6 +17,9 @@
  * A single 0377 at the 1st position in a word set followed by the end of the tape will be treated as a
  * STOP code and not be reported as an error.
  *
+ * If the data following the RIM block is not valid BIN loader format, then the rest of the tape is just
+ * dumped as raw data.
+ *
  * This is a two-pass disassembler to allow the generation of labels and validation of loaded memory addresses.
  * Labels are all of the form 'lnnn', e.g. l123.
  * Only memory addresses seen inside a RIM or BIN block are candidates for labels.
@@ -87,9 +90,15 @@
  * 23/09/2025 wje - Convert to two pass
  * 24/09/2025 wje - Make macro-style formatting of labels nicer, fixes for 'instructions' that are actually data
  * 24/09/2025 wje - Add raw mode for tapes that don't have a standard loader, just dump everything as instructions
- * 25/09/2025 wje - Various fixes around OPR and such. IMPORTANT - the macro1 cross-assembler is broken for law -n!
- * 25/09/2025 wje - So generate 'safe' macro1 for law -n
+ * 25/09/2025 wje - Various fixes around OPR and such.
+ *                  IMPORTANT - assemblers, native and cross, are broken for law -n,
+ *                  so if a binary for 'law -n' is seen generate 'safe' law i n which will give the correct result.
+ *                  The behavior of law -n does not match the original DEC Macro documentation.
+ *                  Instead of law -n generating effectively law i n, the actual negative number is added to the
+ *                  law opcode, producing garbage.
  * 25/09/2025 wje - Add a -s switch to generate 3 char labels for backwards compatibility
+ * 27/09/2025 wje - Continue to process a tape even if a malformed BIN block is found, just output as octal for macro
+ *                  moce, disassemble as usual for regular mode
  *
  */
 #include <stdlib.h>
@@ -152,6 +161,7 @@ int getWord(FILE *, int, int);
 void formatInstr(int, int);
 void printTapeLeader(int);
 void passOne(FILE *);
+void pushbackWord(int);
 
 void markValid(int);
 void markValidByInstruction(int, int);
@@ -170,9 +180,10 @@ bool keep_rim = false;
 bool long_labels = true;
 
 int pass = 1;               // first pass
-int label_number = 0;       // used with memlocs and labels
+int label_number = 1;       // used with memlocs and labels
 int tape_loc = 0;
 int checksum = 0;
+int saved_word = -1;        // for getWord() pushback
 State state;
 
 char labelStr[16];          // for formatting a label
@@ -328,6 +339,7 @@ char tmpstr[16];
 
             case 's':
                 long_labels = false;
+                label_number = 0;
                 break;
 
             default:
@@ -350,6 +362,11 @@ char tmpstr[16];
         exit(1);
     }
 
+    if( !as_macro )
+    {
+        keep_rim = true;            // in verbose mode, always emit the rim data
+    }
+
     if( !raw_mode )
     {
         passOne(fP);                // first pass finds all locations that need labels and validates the tape.
@@ -364,7 +381,6 @@ char tmpstr[16];
     }
     else
     {
-        keep_rim = true;
         printf("Disassembly of file %s\n", cP);
     }
 
@@ -394,12 +410,17 @@ char tmpstr[16];
                 if( !as_macro )
                 {
                     printf("Start of RIM block at tape position %d\n", tape_loc - 3);
-                    printf("Tape  Addr  Raw    Lbl  Instruction\n");
+                    printf("Tape  Addr  Raw    Lbl   Instruction\n");
                 }
 
                 word = getWord(fP, 2, state);
                 if( keep_rim )
                 {
+                    if( as_macro )                  // emit our starting address
+                    {
+                        printf("%o/\n", cur_addr);
+                    }
+
                     formatInstr(cur_addr, word);
                 }
             }
@@ -410,6 +431,10 @@ char tmpstr[16];
             {
                 state = LOOKING;                // look for a BIN block now
                 start_addr = OPERAND(word);
+                if( !as_macro )
+                {
+                    printf("End of RIM loading, start address is %04o\n", start_addr);
+                }
 
                 // Reset our address to 0, initial condition
                 start_addr = cur_addr = 0;
@@ -434,7 +459,7 @@ char tmpstr[16];
                 if( !as_macro )
                 {
                     printf("\nStarting BIN block at tape position %d\n", tape_loc - 3);
-                    printf("Tape  Addr  Raw    Lbl  Instruction\n");
+                    printf("Tape  Addr  Raw    Lbl   Instruction\n");
                 }
 
                 checksum = word;            // initial checksum
@@ -444,14 +469,31 @@ char tmpstr[16];
                     printf("%o/\n", cur_addr);  // set addr for macro
                 }
 
-                word = getWord(fP, 2, state);         // will be 'dio endaddr + 1'
-                end_addr = OPERAND(word);       // last location + 1, in checksum as the dio instruction
+                word = getWord(fP, 2, state);         // shold be 'dio endaddr + 1'
+                if( OPERATION(word) != 032 )          // not, so this is not in ddt bin format
+                {
+                    if( as_macro )              // don't lose the initial dio
+                    {
+                        printf("\n/Beginning of non-BIN data\n");
+                        printf("     dio %04d\n", cur_addr);
+                    }
+                    else
+                    {
+                        printf("\nBeginning of non-BIN data\n");
+                        formatInstr(cur_addr, 0320000 | cur_addr);
+                    }
 
-                checksum = addOnesComplement(checksum, word);
-
-                state = BIN;
+                    state = DATA;               // could be more on the tape, back to searching for RIM
+                    pushbackWord(word);         // so we don't lose it transitioning to state DATA
+                }
+                else
+                {
+                    end_addr = OPERAND(word);       // last location + 1, in checksum as the dio instruction
+                    checksum = addOnesComplement(checksum, word);
+                    state = BIN;
+                }
             }
-            else if( OPERATION(word) == 060 )   // JMP, done loading BIN blocks
+            else if( OPERATION(word) == 060 )   // JMP, done loading BIN block
             {
                 if( as_macro )
                 {
@@ -463,7 +505,6 @@ char tmpstr[16];
                 }
 
                 DIAGNOSTIC("Saw jmp %04o at tape location %d, new state is DATA", OPERAND(word), tape_loc);
-                state = DATA;                // could be more on the tape, back to searching for RIM
             }
             else
             {
@@ -495,6 +536,15 @@ char tmpstr[16];
             break;
 
         case DATA:                                      // we got past the end of all BIN blocks, ignore the rest
+            if( as_macro )
+            {
+                printf("     %06o\n", word);
+            }
+            else
+            {
+                // word will contain the 18 bit value for the current pc
+                formatInstr(cur_addr++, word);
+            }
             break;
 
         default:
@@ -560,11 +610,6 @@ char tmpstr[16];
                 DIAGNOSTIC("New state is RIM");
                 cur_addr = OPERAND(word);
 
-                if( as_macro )
-                {
-                    DIAGNOSTIC("RIM start");
-                }
-
                 if( (word = getWord(fP, 1, state)) == -1 )
                 {
                     return;                         // all done
@@ -572,11 +617,7 @@ char tmpstr[16];
 
                 if( keep_rim )
                 {
-                    instructionP = &opcodes[OPERATION(word)];
-                    if( instructionP->modifiers == CAN_INDIRECT )
-                    {
-                        markValidByInstruction(cur_addr, word);
-                    }
+                    markValidByInstruction(cur_addr, word);
                 }
             }
             else
@@ -597,7 +638,7 @@ char tmpstr[16];
 
                 if( keep_rim )
                 {
-                    markValid(start_addr);
+                    markValidByInstruction(cur_addr, word);
                 }
 
                 DIAGNOSTIC("End of RIM, start address %04o\n", start_addr);
@@ -614,8 +655,12 @@ char tmpstr[16];
             else if( OPERATION(word) == 032 )   // next data word to load
             {
                 cur_addr = OPERAND(word);
-                markValid(start_addr);
+
                 word = getWord(fP, 1, state);
+                if( keep_rim )
+                {
+                    markValidByInstruction(cur_addr, word);
+                }
             }
             else
             {
@@ -637,8 +682,7 @@ char tmpstr[16];
                 if( OPERATION(word) != 032 )        // should have been another DIO
                 {
                     fprintf(stderr,"Malformed BIN start, no 2nd DIO  at tape position %d\n", tape_loc - 3);
-                    fclose(fP);
-                    exit(1);
+                    return;                         // nothing more in pass one for the rest
                 }
 
                 checksum = addOnesComplement(checksum, word);
@@ -685,8 +729,6 @@ char tmpstr[16];
             break;
         }
     }
-
-    //markValid(start_addr);
 }
 
 // Perform 18-bit 1's complement additon, handling the carry-wraparound.
@@ -722,6 +764,7 @@ adjustOverflow(int a)
 
 
 // Return the next 18 bit word, 3 tape characters, from the 'tape', or -1 if EOF.
+// If a word was pushed back, return it instead.
 // Since this is the equivalent of the RPB instruction, ignore any without bit o200 set.
 // But, if pass 2 and seen before a binary-flagged byte, print the byte as a label part, suppressing extra blanks.
 
@@ -738,6 +781,13 @@ int saw_space;
     count = 3;              // we need 3 tape bytes for a word
     saw_space = 0;
     ch = last_ch = 0;       // character read before the current character, needed for STOP detection
+
+    if( saved_word != -1 )  // we had a pushed-back word
+    {
+        word = saved_word;
+        saved_word = -1;
+        return( word );
+    }
 
     while( count )
     {
@@ -788,6 +838,12 @@ int saw_space;
     }
     
     return( word );
+}
+
+void
+pushbackWord(int word)
+{
+    saved_word = word;
 }
 
 Special *
@@ -847,7 +903,11 @@ Special *sP;
 
     if( getLabel(pc, pc, labelStr) != -1 )
     {
-        strcat(labelStr,",");
+        if( as_macro )
+        {
+            strcat(labelStr,",");
+        }
+
         for( tmp = strlen(labelStr) + 1; tmp++ < 6; )
         {
             strcat(labelStr, " ");
@@ -864,7 +924,7 @@ Special *sP;
     }
     else
     {
-        printf("%-5d %04o: %06o %s", tape_loc, pc, word, (labelStr[0] != '\0')?labelStr:"");
+        printf("%-5d %04o: %06o %s", tape_loc, pc, word, (labelStr[0] != '\0')?labelStr:"     ");
     }
 
     opcode = OPERATION(word);
@@ -875,17 +935,9 @@ Special *sP;
     DIAGNOSTIC("Pass 2 got opcode %02o, indirect %s, operand %04o\n", opcode, indirect?"y":"n", operand);
     instructionP = &opcodes[opcode];
 
-    if( instructionP->modifiers == IS_ILLEGAL )            // not an instruction, leave blank unless macro mode
+    if( instructionP->modifiers == IS_ILLEGAL )            // not an instruction, just emit the octal value
     {
-        if( as_macro )
-        {
-            printf(" %06o\n", word);
-        }
-        else
-        {
-            printf("\n");
-        }
-
+        printf(" %06o\n", word);
         return;
     }
 
@@ -914,7 +966,6 @@ Special *sP;
 
     case IS_LAW:
         // The versions of macro1 floating arund are broken, they don't hande the 'law -n' syntax properly.
-        // So, use a safe varsion.
         //printf(" %s %s%04o", instructionP->name, (indirect)?"-":"", operand);
         printf(" %s %s%04o", instructionP->name, (indirect)?"i ":"", operand);
         if( !as_macro )
