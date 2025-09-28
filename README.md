@@ -2,36 +2,39 @@
 
 ## SYNOPSIS
 ```
-disassemble_tape  [-m] [-i] [-k] [-d] [-r] [-s] tapeimagefile >resultfile
+disassemble_tape  [-m] [-c] [-i] [-k] [-d] tapeimagefile
 ```
 ## DESCRIPTION
 This is a two-pass disassembler for PDP-1 tape image files that contain RIM and BIN format data.
-In the default use, an annotated listing is given on stdout.
-A macro mode is supported to produce pure macro-compatible code, again on stdout.
-For either mode, any memory location that is an address targeted by an instruction is assigned a label.
+All non-error output goes to stdout.  
+Three modes are supported.
+The default is to list the disassembled tape in an informative format, but this cannot be assembled.  
+Macro mode emits source that can be assembled by the MACRO1 and derivative assemblers.  
+Comatiblity mode emits source that can be assembled by the native PDP-1 macro assembler.  
+
+The difference between macro mode and compatibilty mode is that for macro mode, 4 character labels are generated
+and combined operate-group microinstructions are
+emitted as e.g. cla!cli!clf 3, but this sytax is not valid for the native assember which does not support
+a bitwise or operator.
+In this case, any composite opr instuction is just emitted as its octal equivalent and a comment added.
+No labels are generated for compatibility mode.
+
+For default and macro modes, any memory location that is an address targeted by an instruction is assigned
+a label of the form 'Lnnn'.
 The label will them be used in the instruction and also shown at the target location.
-In macro mode, the standard MACRO syntax is used.
 
 ## OPTIONS
 - '-m' - macro mode, output is compatible with the MACRO1 assembler
+- '-c' - native macro mode, output is compatible with the native PDP-1 macro assembler
 - '-i' - list unknown IOTs encountered on stderr
 - '-k' - if in macro mode an initial RIM code block will not be output because MACRO usuaally does it; this keeps it
 - '-d' - debug mode, not useful except for debugging disassemble_tape
-- '-r' - raw mode, all binary data is dumped as instructions, no loader searching is done
-- '-s' - short label mode, labels are generated as 1-3 alpha characters instead of Lnnn
 - Options can be combined, e.g. -mi.
 
 ## LIMITATIONS
-This program expects a RIM mode loader section that loads the standards digital-1-3-s-mb.ddt.bin BIN loader.
-If this is not the case, you can expect disassembly to fail with usually an error stating there is a malformed
-BIN block.
-In this case, the -r flag can be used to dump the tape as pure instructions with no other processing.
-However, if the nonstandard loader uses BIN format, then the tape will be read as usual.
-The key factor is that everything after the RIM section must conform to the standard BIN format.  
-
 This program must be used with some care. A binary tape does not specify if a block of information is actually
 PDP-1 instructions or if it's data. As an example, MACRO1 will produce a block for constants and andther
-for variables. There is nothing to identify those blocks as such, that must be decided by the user.  
+for variables. There is nothing to identify those blocks as such, that must be decided by the user.
 
 A tape image is expected to start with a 'read in' format block of data, RIM, usually followed by one or more BIN
 blocks.
@@ -44,30 +47,17 @@ Any non-binary character is ignored, even if in a word sequence.
 However, any non-binary characters that are seen up to the first binary character on a tape are considered to be
 part of a label for the tape and will be output in the form they would appear if you were looking at a physical tape.
 
-If the next binary data after the end of a RIM block is not the start of a BIN block, or data after the end of
-a BIN block is not another BIN block, then that data is just dumped as octal values if in macro mode,
-disassembled if not.
-If the next binary data appears to be a BIN block but the next word is not a valid BIN block start, then that data
-and all following is also dumped and no further attempt is made to find a BIN block.
+If in either macro mode, if a JMP is seen following a BIN block, that indicates the end of data as far as the
+macro assembler is concerned, no further data will be emitted.  
 
-## A NOTE ABOUT MACRO1
-Macro1, of which there are a few versions, is a cross-assembler for PDP-1 macro source.
-While it generally follows the native macro functionality, it does very limited error checking.
-It's quite easy to generate binaries that won't work, and unfortunately it rarely warns you.
-In fact, some appear correct in the listing, but the binary code that's output isn't correct.
-So, if you are having issues with code not working, carefully check your source.
-
+Otherwise if there are binary characters outside of a RIM or BIN block,
+they are assumed to comprise 18 bit words and are also disassembled.
 ## ERRORS
-The following errors are possible and will be reported on stderr after which an exit(1) is done:
+The following errors are possible and will be reported on stderr after which an exit(1) is done.
 - Incorrect command line arguments
 - Unterminated RIM block
-
-## WARNINGS
 - Malformed BIN block
 - Premature EOF
-For a malformed BIN block, processing continues as described above.
-For a premature EOF, a binary word of 3 characters was being assembled but EOF was seen before all 3 were read.
-In this case, pass 2 is still run ignoring the characters found.
 
 ## BUILDING
 Just do:

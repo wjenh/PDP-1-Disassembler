@@ -3,22 +3,34 @@
  *
  * See comments on this source below.
  *
- * Tapes are loaded initially using read-in, which ignores any character that doesn't have bit 0200 set.
+ * This program disassembles PDP-1 binary tape images into macro assembly instructions.
+ * Three modes are supported.
+ * The default mode is a verbose disassembly with detailed information about the disassembled content, but it cannot
+ * be assembled.
+ *
+ * The second mode is macro1 mode, which will generate output that can be assembled by the macro1 and variant
+ * assemblers. It will generate labels for referenced locations.
+ * It cannot be assembled by the native PDP-1 assembler.
+ *
+ * The third mode generates output suitable for the native assember, but lacks any label information.
+ *
+ * The PDP-1 binary tapes are loaded initially using read-in, which ignores any character that doesn't have
+ * bit 0200 set.
  * However, many tapes have a leader punched that shows a punch pattern that makes descriptive text.
- * This is also captured by printing out in 'label' form any character up to the first 0200 one.
+ * This is also captured by printing out in 'readable label' form any character up to the first 0200 one.
  *
- * When tapes were loaded for real, the BIN loader would effectively stop at the end of a load because of a JMP
+ * Processing then continues looking for a RIM block, followed by ddt-form BIN blocks.
+ * 
+ * When tapes were loaded, the BIN loader would effectively stop at the end of a load because of a JMP
  * being executed. But, tapes sometimes had additional data following starting in RIM form again.
- * So, while there is data left in the tape image, reading and disassembly will continue after the BIN JMP, going
- ' back to RIM mode.
- * Note that some tapes seem to have random data instead; perhaps the remainder was read under program control.
- * Any data that isn't in a load block will be output as an octal number.
- * An EOT in the middle of a 3 char binary word set will be reported as an error on stderr,
- * A single 0377 at the 1st position in a word set followed by the end of the tape will be treated as a
- * STOP code and not be reported as an error.
+ * For macro modes, this must end processing because the emitted start statement must be the last thing
+ * in the emitted sourde.
  *
- * If the data following the RIM block is not valid BIN loader format, then the rest of the tape is just
- * dumped as raw data.
+ * In default mode, while there is data left in the tape image, reading and disassembly will continue.
+ *
+ * An EOT in the middle of a 3 char binary word set will be reported as a warning on stderr,
+ * A single 0377 at the 1st position in a word set followed by the end of the tape will be treated as a
+ * stp code and not be reported as an error.
  *
  * This is a two-pass disassembler to allow the generation of labels and validation of loaded memory addresses.
  * Labels are all of the form 'lnnn', e.g. l123.
@@ -34,7 +46,7 @@
  * 032 aaaa dddddd  store dddddd at adr aaaa, 6 tape chars
  * 060 aaaa         end and jmp to adr aaaa, 3 tape chars
  *
- * BIN format
+ * DDT BIN format
  *
  * DIO startaddr, 32ssss
  * DIO endaddr + 1, 32eeee
@@ -105,6 +117,7 @@
 #include <stdio.h>
 #include <stdbool.h>
 #include <string.h>
+#include <libgen.h>
 
 #define DIAGNOSTIC(args...) if( diagnostics ) {printf(args); printf("\n");}
 
@@ -125,7 +138,7 @@
 #define OPR_MASK_STF 00010
 
 // The processing loop is a simple state machine
-typedef enum {START, RESTART, LOOKING, RIM, BIN, DATA, RAW} State;
+typedef enum {START, RESTART, LOOKING, RIM, BIN, DATA, RAW, DONE} State;
 
 // Indicates instruction-specific additional processing needed
 typedef enum {NONE, CAN_INDIRECT, IS_SKIP, IS_SHIFT, IS_OPR, IS_IOT, IS_LAW, IS_CALJDA, IS_ILLEGAL} Modifiers;
@@ -177,7 +190,7 @@ bool raw_mode = false;
 bool unknown_iots = false;
 bool diagnostics = false;
 bool keep_rim = false;
-bool long_labels = true;
+bool compatibility_mode = false;
 
 int pass = 1;               // first pass
 int label_number = 1;       // used with memlocs and labels
@@ -185,6 +198,7 @@ int tape_loc = 0;
 int checksum = 0;
 int saved_word = -1;        // for getWord() pushback
 State state;
+char separator[4];          // used in macro and compatibility modes
 
 char labelStr[16];          // for formatting a label
 
@@ -294,7 +308,8 @@ int word, word2;
 int cur_addr;
 int end_addr;               // for BIN loader
 int start_addr = 4;        // for macro start, can come from RIM if no BIN blocks, 4 is the default if none
-char *filenameP;
+char filename[256];
+char shortname[256];
 
 bool did_start = false;
 
@@ -302,6 +317,8 @@ char *cP;
 
 FILE *fP;
 char tmpstr[16];
+
+    strcpy(separator, "!");         // is a logical or in macro1
 
     // parse our comd line args
     while( --argc > 0 )
@@ -337,9 +354,10 @@ char tmpstr[16];
                 raw_mode = true;
                 break;
 
-            case 's':
-                long_labels = false;
-                label_number = 0;
+            case 'c':
+                compatibility_mode = true;
+                as_macro = true;
+                strcpy(separator, " ");         // just used in some comments
                 break;
 
             default:
@@ -354,11 +372,11 @@ char tmpstr[16];
         usage();                // should only be the input filename
     }
 
-    filenameP = cP;
+    strcpy(filename,cP);
 
-    if( !(fP = fopen(filenameP, "r")) )
+    if( !(fP = fopen(filename, "r")) )
     {
-        fprintf(stderr,"Can't open file '%s'\n", filenameP);
+        fprintf(stderr,"Can't open file '%s'\n", filename);
         exit(1);
     }
 
@@ -371,17 +389,25 @@ char tmpstr[16];
     {
         passOne(fP);                // first pass finds all locations that need labels and validates the tape.
         fclose(fP);
-        fP = fopen(filenameP, "r"); // reopen for second pass
+        fP = fopen(filename, "r"); // reopen for second pass
         tape_loc = 0;               // reset tape position
     }
 
     if( as_macro )
     {
-        printf("Disassembled from %s\n", cP);
+        strcpy(shortname, basename(filename));
+
+        // sorry, can't have a dot.
+        if( (cP = strrchr(shortname, '.')) )
+        {
+            *cP = '\0';
+        }
+
+        printf("Disassembled from %s\n", shortname);
     }
     else
     {
-        printf("Disassembly of file %s\n", cP);
+        printf("Disassembled from %s\n", filename);
     }
 
     // We don't check for errors because those were already detected by pass one
@@ -391,6 +417,11 @@ char tmpstr[16];
     // The state machine loop
     for(;;)
     {
+        if( state == DONE )
+        {
+            break;
+        }
+
         word = getWord(fP, 2, state);
 
         if( word == -1 )
@@ -493,15 +524,21 @@ char tmpstr[16];
                     state = BIN;
                 }
             }
-            else if( OPERATION(word) == 060 )   // JMP, done loading BIN block
+            else if( OPERATION(word) == 060 )   // JMP, done loading BIN blocks, end of valid input
             {
                 if( as_macro )
                 {
                     if( getLabel(OPERAND(word), OPERAND(word), labelStr) != -1 )
                     {
                         printf("     start %s\n", labelStr); // macro directive to give start addr
-                        did_start = true;
                     }
+                    else
+                    {
+                        printf("     start %04o\n", OPERAND(word));
+                    }
+
+                    did_start = true;
+                    state = DONE;
                 }
 
                 DIAGNOSTIC("Saw jmp %04o at tape location %d, new state is DATA", OPERAND(word), tape_loc);
@@ -1030,11 +1067,12 @@ Special *sP;
 
     case IS_OPR:
         // This one is a pain because multiple operations can be combined.
-        // Detecting extra bits, same.
-        // If we see any extra bits, then just the octal data is output.
+        // Macro1 allows an 'or' operation, 'a!b', which is used in macro mode.
+        // However, the native assembler doesn't support this, so any combined operations
+        // are emitted as the octal word with a comment.
+        // If we see any extra bits not valid microinstuctions, then just the octal data is output.
         tmp = 0;                // set to 1 if we have printed one already
         tmpstr[0] = 0;          // be sure we start empty
-
         printf(" ");
 
         // A special case is nothing set, means nop
@@ -1051,42 +1089,42 @@ Special *sP;
             if( (operand & OPR_MASK_LAT) == OPR_MASK_LAT )    // MUST come befoe CLA! Only 2 bit directive.
             {
                 operand &= ~OPR_MASK_LAT;
-                sprintf(tmpstr2,"%slat", tmp?"!":"");
+                sprintf(tmpstr2,"%slat", tmp?separator:"");
                 strcat(tmpstr, tmpstr2);
                 tmp = 1;
             }
             if( operand & OPR_MASK_CLA )        // MUST come after LAT!
             {
                 operand &= ~OPR_MASK_CLA;
-                sprintf(tmpstr2,"%scla", tmp?"!":"");
+                sprintf(tmpstr2,"%scla", tmp?separator:"");
                 strcat(tmpstr, tmpstr2);
                 tmp = 1;
             }
             if( operand & OPR_MASK_CLI )
             {
                 operand &= ~OPR_MASK_CLI;
-                sprintf(tmpstr2,"%scli", tmp?"!":"");
+                sprintf(tmpstr2,"%scli", tmp?separator:"");
                 strcat(tmpstr, tmpstr2);
                 tmp = 1;
             }
             if( operand & OPR_MASK_CMA )
             {
                 operand &= ~OPR_MASK_CMA;
-                sprintf(tmpstr2,"%scma", tmp?"!":"");
+                sprintf(tmpstr2,"%scma", tmp?separator:"");
                 strcat(tmpstr, tmpstr2);
                 tmp = 1;
             }
             if( operand & OPR_MASK_HLT )
             {
                 operand &= ~OPR_MASK_HLT;
-                sprintf(tmpstr2,"%shlt", tmp?"!":"");
+                sprintf(tmpstr2,"%shlt", tmp?separator:"");
                 strcat(tmpstr, tmpstr2);
                 tmp = 1;
             }
             if( !(operand & OPR_MASK_STF) && bits03 )
             {
                 // CLF is bits03, already cleared
-                sprintf(tmpstr2,"%sclf %o", tmp?"!":"", bits03);
+                sprintf(tmpstr2,"%sclf %o", tmp?separator:"", bits03);
                 strcat(tmpstr, tmpstr2);
                 bits03 = 0;                  // done with these
                 tmp = 1;
@@ -1094,14 +1132,25 @@ Special *sP;
             if( (operand & OPR_MASK_STF) && bits03 )
             {
                 operand &= ~OPR_MASK_STF;
-                sprintf(tmpstr2,"%sstf %o", tmp?"!":"", bits03);
+                sprintf(tmpstr2,"%sstf %o", tmp?separator:"", bits03);
                 strcat(tmpstr, tmpstr2);
                 bits03 = 0;                  // done with these
                 tmp = 1;
             }
         }
 
-        if( (operand | bits03) != 0 )                      // extra bits were left over, must be data
+        if( compatibility_mode && (tmp == 1) )                  // multi component
+        {
+            if( operand | bits03 )                              // extra bits set
+            {
+                printf("%06o", word);
+            }
+            else
+            {
+                printf("%06o / %s", word, tmpstr);
+            }
+        }
+        else if( (operand | bits03) != 0 )                      // extra bits were left over, must be data
         {
             printf("%06o", word);
         }
@@ -1128,7 +1177,7 @@ Special *sP;
                     operand |= 010000;       // include the bit in the output
                 }
 
-                printf("%s%05o", (as_macro)?"!":" | ", operand);
+                printf("%s%05o", (as_macro)?separator:" | ", operand);
 
                 if( unknown_iots )
                 {
@@ -1174,7 +1223,7 @@ Special *sP;
 
         if( (sP->modifiers != UNKNOWN) && (tmp2 != 0) )
         {
-            printf("%s%04o", (as_macro)?"!":" | ", tmp2);   // add extra bits
+            printf("%s%04o", (as_macro)?separator:" | ", tmp2);   // add extra bits
         }
         break;
     }
@@ -1186,6 +1235,11 @@ Special *sP;
 void
 markValid(int address)
 {
+    if( compatibility_mode )
+    {
+        return;                         // we don't support labels
+    }
+
     address = OPERAND(address);         // for safety, limits it to 12 bits
 
     memlocs[address].flags |= MEM_VALID;
@@ -1199,6 +1253,11 @@ markValidByInstruction(int addr, int word)
 int opcode;
 int operand;
 CodeDef *instructionP;
+
+    if( compatibility_mode )
+    {
+        return;                         // we don't support labels
+    }
 
     markValid(addr);            //this address is used
 
@@ -1220,6 +1279,11 @@ int itmp, itmp2;
 char ch;
 char *cP;
 
+    if( compatibility_mode )
+    {
+        return;                         // we don't support labels
+    }
+
     if( !(memlocs[address].flags & MEM_TARGET) )
     {
         DIAGNOSTIC("%06o marked as target number %d", address, label_number);
@@ -1228,57 +1292,7 @@ char *cP;
         // construct the label
         cP = memlocs[address].label;
 
-        if( long_labels )
-        {
-            sprintf(cP, "L%d", label_number);
-        }
-        else
-        {
-            ch = (label_number % 26) + 'a';
-
-            if( ch == 'i' )        // don't use i
-            {
-                ++label_number;
-                ++ch;
-            }
-
-            *cP++ = ch;
-
-            if( (label_number > 25) ) // has a second or third char
-            {
-                itmp = (label_number / 26) % 26;            // 2nd char
-                itmp2 = (label_number / (26 * 26)) % 26;    // third char
-
-                if( itmp || itmp2 )
-                {
-                    ch = itmp + 'a';
-
-                    if( ch == 'i' )        // don't use i
-                    {
-                        label_number += 27;
-                        ++ch;
-                    }
-
-                    *cP++ = ch;
-                }
-
-                if( itmp2 )
-                {
-                    ch = itmp2 + 'a';
-
-                    if( ch == 'i' )        // don't use i
-                    {
-                        label_number += (26 * 26) + 1;
-                        ++ch;
-                    }
-
-                    *cP++ = ch;
-                }
-            }
-
-            *cP = '\0';
-        }
-
+        sprintf(cP, "L%d", label_number);
         ++label_number;
         DIAGNOSTIC("Constructed label is %s\n", memlocs[address].label);
     }
@@ -1307,13 +1321,13 @@ char *cP;
 
 void usage()
 {
-    fprintf(stderr,"Usage: disassemble_tape [-midksr] filename\n");
+    fprintf(stderr,"Usage: disassemble_tape [-midkcr] filename\n");
     fprintf(stderr,"where:\n");
     fprintf(stderr,"m - output in pure macro assember form\n");
     fprintf(stderr,"i - print any unknown IOTs on stderr\n");
     fprintf(stderr,"d - enable diagnostics for debugging this progam\n");
     fprintf(stderr,"k - keep RIM loader code if seen and in macro mode; normally no because MACRO usually adds it\n");
-    fprintf(stderr,"s - create only up to 3 char labels for compatibility with the native PDP-1 assembler\n");
+    fprintf(stderr,"c - compatibility with native assembler mode\n");
     fprintf(stderr,"r - raw mode, just dump every binary word as an instruction, no RIM or BIN checking\n");
     fprintf(stderr,"    raw verrides all other flags except d\n");
     fprintf(stderr,"Flags can be together, -mid, or separate, -m -i -d\n");
