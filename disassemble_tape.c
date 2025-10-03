@@ -22,9 +22,10 @@
  * Processing then continues looking for a RIM block, followed by ddt-form BIN blocks.
  * 
  * When tapes were loaded, the BIN loader would effectively stop at the end of a load because of a JMP
- * being executed. But, tapes sometimes had additional data following starting in RIM form again.
+ * being executed. But, tapes sometimes had additional data following.
  * For macro modes, this must end processing because the emitted start statement must be the last thing
  * in the emitted sourde.
+ * Any remaining data is ignored.
  *
  * In default mode, while there is data left in the tape image, reading and disassembly will continue.
  *
@@ -109,8 +110,9 @@
  *                  Instead of law -n generating effectively law i n, the actual negative number is added to the
  *                  law opcode, producing garbage.
  * 25/09/2025 wje - Add a -s switch to generate 3 char labels for backwards compatibility
- * 27/09/2025 wje - Continue to process a tape even if a malformed BIN block is found, just output as octal for macro
- *                  moce, disassemble as usual for regular mode
+ * 27/09/2025 wje - Continue to process a tape even if a malformed BIN block is found, jsut give a warning.
+ * 28/09/2025 wje - Add -c for compalibility mode, will emit source that works with the native PDP-1 macro assembler.
+ * 03/10/2025 wje - Handle non-standard tapes better, bail if in macro mode, dump in default mode.
  *
  */
 #include <stdlib.h>
@@ -480,6 +482,28 @@ char tmpstr[16];
                     formatInstr(cur_addr, word);
                 }
             }
+            else
+            {
+                // We didn't get what we expected, not a standard macro-generated tape.
+                if( as_macro )
+                {
+                    fprintf(stderr,"Nonstandard binary tape, unterminated RIM block at tape location %d\n",
+                        tape_loc - 3);
+                    fprintf(stderr,"Terminating.\n");
+                    fclose(fP);
+                    exit(1);
+                }
+                else
+                {
+                    fprintf(stderr,"Nonstandard binary tape, unterminated RIM block at tape location %d.\n",
+                        tape_loc - 3);
+                    fprintf(stderr,"Dumping remaining data as random code.\n");
+
+                    printf("Dumping remainder as random data.\n");
+                    formatInstr(0, word);                           // include what we just saw
+                    state = DATA;
+                }
+            }
             break;
 
         case LOOKING:
@@ -503,19 +527,27 @@ char tmpstr[16];
                 word = getWord(fP, 2, state);         // shold be 'dio endaddr + 1'
                 if( OPERATION(word) != 032 )          // not, so this is not in ddt bin format
                 {
-                    if( as_macro )              // don't lose the initial dio
+                    DIAGNOSTIC(
+                "State LOOKING, got a DIO but next word was not one, bad BIN bloct at tape_location %d\n",
+                        tape_loc = 3);
+
+                    if( as_macro )                      // bail out
                     {
-                        printf("\n/Beginning of non-BIN data\n");
-                        printf("     dio %04d\n", cur_addr);
+                        fprintf(stderr,
+                    "Looking for a BIN block, but saw a non-standard block at tape location %d, terminating.\n",
+                            tape_loc = 3);
+                        fclose(fP);
+                        exit(1);
                     }
                     else
                     {
                         printf("\nBeginning of non-BIN data\n");
-                        formatInstr(cur_addr, 0320000 | cur_addr);
-                    }
+                        formatInstr(cur_addr, 0320000 | cur_addr);  // the first word, a DIO.
+                        ++cur_addr;
+                        pushbackWord(word);         // so we don't lose it transitioning to state DATA
 
-                    state = DATA;               // could be more on the tape, back to searching for RIM
-                    pushbackWord(word);         // so we don't lose it transitioning to state DATA
+                        state = DATA;               // could be more on the tape, back to searching for RIM
+                    }
                 }
                 else
                 {
@@ -526,27 +558,46 @@ char tmpstr[16];
             }
             else if( OPERATION(word) == 060 )   // JMP, done loading BIN blocks, end of valid input
             {
-                if( as_macro )
+                if( getLabel(OPERAND(word), OPERAND(word), labelStr) != -1 )
                 {
-                    if( getLabel(OPERAND(word), OPERAND(word), labelStr) != -1 )
-                    {
-                        printf("     start %s\n", labelStr); // macro directive to give start addr
-                    }
-                    else
-                    {
-                        printf("     start %04o\n", OPERAND(word));
-                    }
-
-                    did_start = true;
-                    state = DONE;
+                    printf("\n     start %s\n", labelStr); // macro directive to give start addr
+                }
+                else
+                {
+                    printf("\n     start %04o\n", OPERAND(word));
                 }
 
-                DIAGNOSTIC("Saw jmp %04o at tape location %d, new state is DATA", OPERAND(word), tape_loc);
+                if( as_macro )
+                {
+                    did_start = true;
+                    state = DONE;
+                    DIAGNOSTIC("Saw jmp %04o at tape location %d, new state is DONE", OPERAND(word), tape_loc);
+                }
+                else
+                {
+                    formatInstr(cur_addr, word);            // emit the JMP
+                    printf("\n");
+                    state = DATA;
+                    DIAGNOSTIC("Saw jmp %04o at tape location %d, new state is DATA", OPERAND(word), tape_loc);
+                }
             }
             else
             {
-                // Not in a block, dump whatever it is with address 0
-                formatInstr(0, word);
+                // Random data outside a RIM or BIN
+                if( as_macro )
+                {
+                        fprintf(stderr,
+                    "Looking for a RIM or BIN, but saw random binary at tape location %d, terminating.\n",
+                        tape_loc + 3);
+
+                        fclose(fP);
+                        exit(1);
+                }
+                else
+                {
+                    // Just dump it with no address
+                    formatInstr(0, word);
+                }
             }
             break;
 
@@ -569,19 +620,9 @@ char tmpstr[16];
             break;
 
         case RAW:
-            formatInstr(0, word);                       // we don't know the address
-            break;
-
         case DATA:                                      // we got past the end of all BIN blocks, ignore the rest
-            if( as_macro )
-            {
-                printf("     %06o\n", word);
-            }
-            else
-            {
-                // word will contain the 18 bit value for the current pc
-                formatInstr(cur_addr++, word);
-            }
+            // word will contain the 18 bit value we read, dump it
+            formatInstr(0, word);
             break;
 
         default:
@@ -701,9 +742,11 @@ char tmpstr[16];
             }
             else
             {
-                fprintf(stderr,"Unterminated RIM block at tape position %d\n", tape_loc);
-                fclose(fP);
-                exit(1);
+                // We expectd an 032 or an 060, didn't get it.
+                // This means the tape isn't a standard RIM/BIN produced by macro.
+                // Just stop pass one, let pass two deal with it.
+                DIAGNOSTIC("Unterminated RIM block at tape position %d\n", tape_loc);
+                return;
             }
             break;
 
@@ -716,9 +759,8 @@ char tmpstr[16];
                 checksum = word;            // initial checksum
                 word = getWord(fP, 1, state);         // will be 'dio endaddr + 1'
 
-                if( OPERATION(word) != 032 )        // should have been another DIO
+                if( OPERATION(word) != 032 )        // should have been another DIO, give up
                 {
-                    fprintf(stderr,"Malformed BIN start, no 2nd DIO  at tape position %d\n", tape_loc - 3);
                     return;                         // nothing more in pass one for the rest
                 }
 
@@ -729,6 +771,7 @@ char tmpstr[16];
             }
             else if( OPERATION(word) == 060 )   // JMP, done loading BIN blocks
             {
+                DIAGNOSTIC("Found a JMP outside RIM or BIN at tape position %d\n", tape_loc - 3);
                 markTarget(OPERAND(word));
                 state = RESTART;                // could be more on the tape, back to searching for RIM
                 DIAGNOSTIC("New state is RESTART");
@@ -969,7 +1012,6 @@ Special *sP;
     opcode >>= 1;                                           // convert to 32 possible instructions
 
     operand = OPERAND(word);
-    DIAGNOSTIC("Pass 2 got opcode %02o, indirect %s, operand %04o\n", opcode, indirect?"y":"n", operand);
     instructionP = &opcodes[opcode];
 
     if( instructionP->modifiers == IS_ILLEGAL )            // not an instruction, just emit the octal value
