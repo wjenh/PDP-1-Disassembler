@@ -53,6 +53,10 @@ macro assembler is concerned, no further data will be emitted.
 
 In default mode, if there are binary characters outside of a RIM or BIN block
 they are assumed to comprise 18 bit words and are also disassembled.
+
+## EMBEDDABLE DISASSEMBLER
+The decondeInstruction.c code provides a standalone instruction disassembler that can be embedded in other code
+that needs a readable version of a binary instruction word.
 ## ERRORS
 The following errors are possible and will be reported on stderr after which an exit(1) is done.
 - Incorrect command line arguments
