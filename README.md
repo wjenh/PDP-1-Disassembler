@@ -2,7 +2,7 @@
 
 ## SYNOPSIS
 ```
-disassemble_tape  [-m] [-c] [-i] [-k] [-d] tapeimagefile
+disassemble_tape  [-m] [-c] [-i] [-k] [-d] [-a] tapeimagefile
 ```
 ## DESCRIPTION
 This is a two-pass disassembler for PDP-1 tape image files that contain RIM and BIN format data
@@ -31,6 +31,7 @@ The label will them be used in the instruction and also shown at the target loca
 - '-k' - if in macro mode an initial RIM code block will not be output because MACRO usuaally does it; this keeps it
 - '-r' - Raw mode, just dump the tape as instructions or binary words, no RIM or BIN searching (not for macro)
 - '-d' - debug mode, not useful except for debugging disassemble_tape
+- '-a' - am1 assembler extended loader compatibility, use for any am1 binaries
 - Options can be combined, e.g. -mi.
 
 ## LIMITATIONS
